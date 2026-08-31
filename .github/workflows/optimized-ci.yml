@@ -1,0 +1,155 @@
+name: Optimized CI/CD (Small)
+
+on:
+  push:
+    branches: [main, develop]
+    # ✅ include workflow + docs + script so Task 2/4 pushes trigger
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'package*.json'
+      - '.github/workflows/**'
+      - 'performance-check.sh'
+      - 'LAB3-GUIDE.md'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [development, staging, production]
+        default: development
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.detect.outputs.environment }}
+      deploy: ${{ steps.detect.outputs.deploy }}
+    steps:
+      - name: Checkout (fetch 2 for diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect environment & deploy toggle
+        id: detect
+        shell: bash
+        run: |
+          # default via dispatch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          else
+            # branch-based default
+            if [ "${{ github.ref_name }}" = "main" ]; then ENV="production";
+            elif [ "${{ github.ref_name }}" = "develop" ]; then ENV="staging";
+            else ENV="development"; fi
+          fi
+
+          # change classification: docs-only vs app-impacting
+          CHANGED=$(git diff --name-only HEAD^ HEAD || true)
+          echo "Changed files:"; echo "$CHANGED"
+
+          APP_PAT='^(src/|tests/|package(-lock)?\.json)'
+          DOCS_PAT='^(\.github/workflows/|LAB3-GUIDE\.md|performance-check\.sh|README\.md)'
+
+          ONLY_DOCS=true
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            if [[ ! "$f" =~ $DOCS_PAT ]]; then ONLY_DOCS=false; break; fi
+          done <<< "$CHANGED"
+
+          if $ONLY_DOCS; then
+            # docs/workflow/script only → development + no deploy
+            ENV="development"
+            DEPLOY=false
+          else
+            # app-impacting changes → deploy on main/develop
+            if [[ "$CHANGED" =~ $APP_PAT ]]; then DEPLOY=true; else DEPLOY=false; fi
+          fi
+
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "deploy=$DEPLOY"   >> $GITHUB_OUTPUT
+          echo "Resolved environment: $ENV"
+          echo "Deploy? $DEPLOY"
+
+      - name: Setup Node (cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+  quality:
+    runs-on: ubuntu-latest
+    needs: setup
+    strategy:
+      matrix:
+        check: [test, lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install deps
+        run: npm ci --prefer-offline --no-audit
+      - name: Tests
+        if: matrix.check == 'test'
+        run: npm test
+      - name: Lint
+        if: matrix.check == 'lint'
+        run: npm run lint
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [setup, quality]
+    outputs:
+      size: ${{ steps.size.outputs.size }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install deps
+        run: npm ci --prefer-offline --no-audit
+      - name: Build
+        run: npm run build
+      - name: Build size
+        id: size
+        run: echo "size=$(du -sh dist | cut -f1)" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ needs.setup.outputs.environment }}-${{ github.run_number }}
+          path: dist/
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    if: needs.setup.outputs.deploy == 'true'
+    environment:
+      name: ${{ needs.setup.outputs.environment }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ needs.setup.outputs.environment }}-${{ github.run_number }}
+          path: deploy/
+      - name: Deploy (placeholder)
+        run: |
+          echo "Deploying to ${{ needs.setup.outputs.environment }}..."
+          # your real deploy logic goes here
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [setup, quality, build, deploy]
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "Env:      ${{ needs.setup.outputs.environment }}"
+          echo "Deploy?:  ${{ needs.setup.outputs.deploy }}"
+          echo "Build sz: ${{ needs.build.outputs.size }}"
