@@ -1,0 +1,2 @@
+# simple-cicd-pipeline
+globalknowledge
